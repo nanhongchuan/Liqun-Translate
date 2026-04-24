@@ -1,0 +1,42 @@
+---
+description: 项目简介、架构、目录与安全原则（与 PRD 一致）
+alwaysApply: true
+---
+
+# 实时翻译（本地 Web + 本机服务）
+
+## 项目简介
+
+- **目标**：在 macOS 上通过本机 **麦克风 → ASR → LLM 翻译** 在浏览器中准实时展示；第一期为 **Web UI + 本地 FastAPI**，不依赖桌面壳；第二期再评估 **Tauri/Electron** 壳。
+- **用户**：首期作者自用、单用户、本机部署。
+- **PRD 权威来源**：`实时翻译-产品需求文档.md`；实现以 PRD 为准，规则文件仅作开发约束摘要。
+
+## 技术架构（第一期）
+
+| 层 | 选型 |
+|----|------|
+| 前端 | React 18、TypeScript、Vite、SPA、无 SSR |
+| UI | Tailwind CSS、Radix UI、 lucide-react |
+| 后端 | Python 3.11+、FastAPI；ASR 优先 **faster-whisper**；HTTP/WebSocket |
+| LLM | OpenAI Chat Completions **兼容**；**仅后端** 带 Key 代理，前端不落 Key 明文 |
+| 访问 | 浏览器访问 `http://localhost:<前端端口>`，API 指向本机 `127.0.0.1:<后端>`（**同源或显式配置**） |
+
+## 目标目录结构（可随里程碑补齐）
+
+- `src/`：前端（`components/` 页面与共享组件、`main.tsx`、`index.css`）
+- `backend/` 或 `api/`：FastAPI 应用（`app/main.py`、路由、服务层；**勿**把密钥提交进仓库）
+- `docs/references/ui/`：界面参考图（见 PRD 附录，可选）
+- 根配置：`vite.config.ts`、`tailwind.config.js`、`tsconfig.json`、`package.json`；后续 Python 可用 `pyproject.toml` 或 `requirements.txt`
+
+## 安全与隐私（强制）
+
+- **API Key、Base URL**：经后端测试与保存；**禁止** 在前端 `localStorage` 等处以明文存 Key；日志不打印完整 Key。
+- **监听地址**：后端默认仅 **`127.0.0.1`**，勿改为 `0.0.0.0` 对外暴露除非用户知悉风险。
+- **音频**：默认本地 ASR；**仅** 为翻译的文本段发往用户配置的 LLM 端点。
+- **模型包**：下载走 HTTPS，**SHA256** 校验；与本机「安装清单」一致。
+
+## 与交付里程碑对齐（摘要）
+
+- M0：前后端可启动、健康检查通。
+- M1+：侧栏 + 落地页 + 同传页 + 设置框架与状态可演示。
+- 后续按 PRD M2–M5 接 LLM、ASR 安装、麦克风流与翻译流。
