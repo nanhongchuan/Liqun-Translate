@@ -5,6 +5,7 @@ import { LandingPage } from "./components/LandingPage";
 import { LiveSessionPage } from "./components/LiveSessionPage";
 import { SettingsPage } from "./components/SettingsPage";
 import { PlaceholderPage } from "./components/PlaceholderPage";
+import { StaleApiBanner } from "./components/StaleApiBanner";
 
 export type MainView = "landing" | "live" | "settings" | "history" | "favorites";
 
@@ -188,35 +189,38 @@ export default function App() {
       </button>
 
       <main
-        className={`relative min-h-0 min-w-0 flex-1 overflow-hidden ${darkMode ? "bg-slate-950" : "bg-[#fafbfc]"}`}
+        className={`relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden ${darkMode ? "bg-slate-950" : "bg-[#fafbfc]"}`}
       >
-        {mainView === "settings" ? (
-          <SettingsPage onBack={goHome} />
-        ) : mainView === "history" ? (
-          <PlaceholderPage title="记录" onBack={goHome} />
-        ) : mainView === "favorites" ? (
-          <PlaceholderPage title="收藏" onBack={goHome} />
-        ) : mainView === "live" ? (
-          <LiveSessionPage
-            sourceLang={sourceLang}
-            targetLang={targetLang}
-            onSourceChange={handleSourceChange}
-            onTargetChange={handleTargetChange}
-            onSwapLangs={handleSwapLangs}
-            onStop={stopSession}
-          />
-        ) : (
-          <LandingPage
-            sourceLang={sourceLang}
-            targetLang={targetLang}
-            onSourceChange={handleSourceChange}
-            onTargetChange={handleTargetChange}
-            onSwapLangs={handleSwapLangs}
-            onStart={startSession}
-            darkMode={darkMode}
-            onToggleDark={() => setDarkMode((d) => !d)}
-          />
-        )}
+        <StaleApiBanner />
+        <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
+          {mainView === "settings" ? (
+            <SettingsPage onBack={goHome} />
+          ) : mainView === "history" ? (
+            <PlaceholderPage title="记录" onBack={goHome} />
+          ) : mainView === "favorites" ? (
+            <PlaceholderPage title="收藏" onBack={goHome} />
+          ) : mainView === "live" ? (
+            <LiveSessionPage
+              sourceLang={sourceLang}
+              targetLang={targetLang}
+              onSourceChange={handleSourceChange}
+              onTargetChange={handleTargetChange}
+              onSwapLangs={handleSwapLangs}
+              onStop={stopSession}
+            />
+          ) : (
+            <LandingPage
+              sourceLang={sourceLang}
+              targetLang={targetLang}
+              onSourceChange={handleSourceChange}
+              onTargetChange={handleTargetChange}
+              onSwapLangs={handleSwapLangs}
+              onStart={startSession}
+              darkMode={darkMode}
+              onToggleDark={() => setDarkMode((d) => !d)}
+            />
+          )}
+        </div>
       </main>
     </div>
   );

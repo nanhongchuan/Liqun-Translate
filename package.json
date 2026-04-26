@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:all": "concurrently -n \"api,web\" -c \"#38bdf8,#c084fc\" \"npm run api\" \"npm run dev\"",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "api": "cd backend && python3 -m uvicorn app.main:app --host 127.0.0.1 --port 18787",
     "api:install": "cd backend && python3 -m pip install -r requirements.txt",
     "test:api": "curl -fsS http://127.0.0.1:18787/api/health | grep -q llm_settings && curl -fsS -o /dev/null -w \"GET /api/settings/llm => %{http_code}\\n\" http://127.0.0.1:18787/api/settings/llm",
-    "api:verify": "curl -fsS http://127.0.0.1:18787/api/health | grep -q llm_test && echo 'OK: 18787 为本项目当前 API（含测试连接）。' || (echo 'FAIL: 18787 未启动或仍为旧版（健康检查无 llm_test）。请结束旧进程后在根目录执行 npm run api。' && exit 1)"
+    "api:verify": "curl -fsS http://127.0.0.1:18787/api/health | grep -q llm_test && npm run api:smoke && echo 'OK: 18787 健康检查与翻译冒烟通过（若失败请先结束旧 uvicorn 再 npm run api）。'",
+    "api:smoke": "cd backend && PYTHONPATH=. python3 scripts/smoke_api.py"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.2",
@@ -28,6 +30,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
     "typescript": "~5.6.3",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "concurrently": "^9.1.0"
   }
 }

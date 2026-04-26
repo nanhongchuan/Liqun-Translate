@@ -3,16 +3,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DEFAULT_LOCAL_API_ORIGIN, trimApiBase } from "../apiBase";
 
 const TARGET_SR = 16000;
-const CHUNK_SAMPLES = 16000;
+const CHUNK_SAMPLES = 12000;
 const LOWER = -0x8000;
 const UPPER = 0x7fff;
+/** 略提输入电平，便于离麦稍远时仍达到可用 SNR（硬限幅在 floatToI16）。 */
+const MIC_DIGITAL_GAIN = 1.55;
 
 type AsrMessage =
   | { type: "transcript"; text: string }
   | { type: "error"; message: string; detail?: string };
 
 const LOCAL_ASR_SETUP_MESSAGE =
-  "本机转写未连接。请在项目根目录另开终端执行「npm run api」，并确保 backend 已安装依赖（cd backend && pip install -r requirements.txt）。若仍失败，请检查默认端口 18787 是否被其它程序占用；可设置环境变量 VITE_API_BASE 指向你的 API 地址。无需外网。";
+  "本机转写未连接。请在项目根执行「npm run dev:all」同时起 API 与前端，或开两个终端分别跑「npm run api」和「npm run dev」；backend 需已装依赖（cd backend && python3 -m pip install -r requirements.txt）。若 18787 被占用，结束该进程后重试；可设置 VITE_API_BASE 指向你的 API 地址。无需外网。启动后点底栏「重试麦克风」。";
 
 function httpBaseToAsrWsUrl(httpBase: string): string {
   const withScheme = httpBase.includes("://") ? httpBase : `http://${httpBase}`;
@@ -25,8 +27,9 @@ function httpBaseToAsrWsUrl(httpBase: string): string {
 }
 
 /**
- * 本机 faster-whisper WebSocket 地址（不依赖 /api/health，避免健康检查与实际情况不一致时误走浏览器云端识别）。
- * 顺序：先直连 127.0.0.1:18787，再经 Vite 代理（若本机 8787 等端口被其它服务占用，直连可避免误连错误进程）。
+ * 本机 faster-whisper WebSocket 地址（不依赖 /api/health）。
+ * - 页面在 `localhost` / `127.0.0.1` 上时**先走同源** `/api/...`（Vite 代理到 18787），避免内嵌预览/部分环境直连跨端口 `127.0.0.1:18787` 失败；再回退直连。
+ * - 其它 host（如 LAN IP）时先直连，便于显式用 `VITE_API_BASE` 指到本机服务。
  */
 function getLocalAsrWebSocketCandidates(): string[] {
   const envBase = trimApiBase(import.meta.env.VITE_API_BASE);
@@ -34,10 +37,13 @@ function getLocalAsrWebSocketCandidates(): string[] {
     return [httpBaseToAsrWsUrl(envBase)];
   }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return [
-    httpBaseToAsrWsUrl(DEFAULT_LOCAL_API_ORIGIN),
-    `${proto}//${location.host}/api/asr/ws`,
-  ];
+  const sameOrigin = `${proto}//${location.host}/api/asr/ws`;
+  const direct = httpBaseToAsrWsUrl(DEFAULT_LOCAL_API_ORIGIN);
+  const isLocalPage = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+  if (isLocalPage) {
+    return [sameOrigin, direct];
+  }
+  return [direct, sameOrigin];
 }
 
 async function connectAsrWebSocketFirstAvailable(
@@ -86,7 +92,7 @@ async function connectAsrWebSocketFirstAvailable(
 export type AsrMode = "faster_whisper" | "browser" | "none";
 
 function floatToI16(f: number): number {
-  const s = Math.max(-1, Math.min(1, f));
+  const s = Math.max(-1, Math.min(1, f * MIC_DIGITAL_GAIN));
   if (s < 0) {
     return Math.max(LOWER, Math.min(0, Math.round(s * 0x8000)));
   }
@@ -184,6 +190,7 @@ export function useLiveAsr({ enabled, language, restartKey = 0 }: Options): {
   errorMessage: string | null;
   transcript: string;
   asrMode: AsrMode;
+  clearTranscript: () => void;
 } {
   const [status, setStatus] = useState<AsrStatus>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -202,6 +209,11 @@ export function useLiveAsr({ enabled, language, restartKey = 0 }: Options): {
   /** 与 React 中 transcript 同步，便于恢复浏览器识别时接在已有内容后。 */
   const transcriptRef = useRef("");
   transcriptRef.current = transcript;
+
+  const clearTranscript = useCallback(() => {
+    setTranscript("");
+    browserFinalsRef.current = "";
+  }, []);
 
   const clearChain = useCallback(() => {
     if (recRef.current) {
@@ -427,6 +439,7 @@ export function useLiveAsr({ enabled, language, restartKey = 0 }: Options): {
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
+            autoGainControl: true,
             channelCount: 1,
           },
         });
@@ -518,7 +531,7 @@ export function useLiveAsr({ enabled, language, restartKey = 0 }: Options): {
     };
   }, [enabled, language, restartKey, clearChain, startBrowserRecognition]);
 
-  return { status, errorMessage, transcript, asrMode };
+  return { status, errorMessage, transcript, asrMode, clearTranscript };
 }
 
 function takeChunk(

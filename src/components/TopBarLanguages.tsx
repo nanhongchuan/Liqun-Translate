@@ -31,6 +31,18 @@ export function getLangLabel(value: string): string {
   return row?.label ?? value;
 }
 
+/** 供翻译 API 使用的无歧义英文目标语名称，避免多语 UI 标签导致模型跟错目标语 */
+export function getLangLlmName(value: string): string {
+  const map: Record<string, string> = {
+    auto: "auto-detect",
+    en: "English",
+    zh: "Simplified Chinese",
+    ja: "Japanese",
+    ko: "Korean",
+  };
+  return map[value] ?? getLangLabel(value);
+}
+
 function LangSelect({
   value,
   onChange,

@@ -3,7 +3,7 @@ import { AudioWaveform, ChevronDown, HelpCircle } from "lucide-react";
 import { apiUrl } from "../apiBase";
 import { useLiveAsr } from "../hooks/useLiveAsr";
 import { SessionTextPanel } from "./SessionTextPanel";
-import { TopBarLanguages, getLangLabel } from "./TopBarLanguages";
+import { TopBarLanguages, getLangLabel, getLangLlmName } from "./TopBarLanguages";
 
 type SessionState = "LIVE" | "PAUSED";
 
@@ -18,13 +18,37 @@ type Props = {
 
 const EXPORT_NO_TRANSLATION = "（暂无译文）";
 
-/** 听写稳定后多久发一批翻译（合并 ASR 碎片，避免逐字打 API） */
-const TRANSLATE_STABLE_MS = 420;
+/** 翻译前短缓冲：等 ASR 片段稍微稳定，避免把单字/半个短语送给模型。 */
+const TRANSLATE_STABLE_MS = 650;
 /**
- * 自「有待译内容」起，最多多久强制发一批（长句不换气时仍能看到准实时更新）
- * 与 TRANSLATE_STABLE_MS 配合，避免无停顿时永远不译
+ * 自出现未跟上译文的原文起，最迟多久发请求（长句不换气时仍能更新）
  */
-const TRANSLATE_MAX_LAG_MS = 1100;
+const TRANSLATE_MAX_LAG_MS = 1800;
+const MIN_SOURCE_DELTA_CHARS = 10;
+const MIN_SOURCE_DELTA_LATIN_CHARS = 22;
+const STREAM_DRAFT_FLUSH_MS = 90;
+
+function isEmptyTranslationStreamMessage(msg: string): boolean {
+  return /翻译流未返回内容|翻译端点未返回译文|翻译未返回内容/.test(msg);
+}
+
+/** 对过短、旧版后端留下的「无法连接或超时：」等提示补充自助排查（多行，见 SessionTextPanel pre-line） */
+function enrichTranslationErrorDetail(msg: string): string {
+  const t = msg.trim();
+  if (!t) {
+    return msg;
+  }
+  if (
+    t.length < 56
+    && /无法连接|或超时[：:]\s*$|等待超时[（(]?[：:]?\s*$|Read timed|Connection|ConnectTimeout|Max retries/i
+      .test(
+        t,
+      )
+  ) {
+    return `${t}\n\n请确认：① 在运行「npm run api」的终端按 Ctrl+C 结束旧进程后再启动，使新代码生效；② 根目录执行「npm run api:smoke」应出现 ALL PASSED；③ 浏览器打开 http://127.0.0.1:18787/api/health 应含 \"llm_translate\":\"requests\"；④ 仍失败时检查「设置」里语言模型 Base URL 与 Key，需要代理可为 API 进程设置 RT_LLM_HTTPS_PROXY。`;
+  }
+  return msg;
+}
 
 async function readApiError(r: Response): Promise<string> {
   const text = await r.text();
@@ -39,6 +63,182 @@ async function readApiError(r: Response): Promise<string> {
   return "请求失败";
 }
 
+/** 与 /api/translate 的备用重试为同一套后端流式逻辑，去重同义提示。 */
+function mergeStreamAndTranslateFallbackError(
+  main: string,
+  fallback: string | null | undefined,
+): string {
+  if (!fallback?.trim()) {
+    return main;
+  }
+  if (fallback === main || main.includes(fallback) || fallback.includes(main)) {
+    return main;
+  }
+  return `${main}（重试：${fallback}）`;
+}
+
+/**
+ * 一轮翻译以 sentAtRequest 为「原文快照」发往后端；若返回时原文字符串已变长（仍在同一段上追加），
+ * 该译文对快照仍有效，应落库并继续展示，并触发对更长原文的后续翻译。若原文已非前缀（如整段重识别），
+ * 本轮结果丢弃，只保留已提交的译文。
+ */
+function shouldApplyThisRound(
+  sentAtRequest: string,
+  currentSrc: string,
+  result: string,
+): boolean {
+  if (!result.trim()) {
+    return false;
+  }
+  if (currentSrc === sentAtRequest) {
+    return true;
+  }
+  if (currentSrc.length > sentAtRequest.length && currentSrc.startsWith(sentAtRequest)) {
+    return true;
+  }
+  return false;
+}
+
+function sourceDeltaForNextRound(snapshot: string, appliedSource: string): {
+  incremental: boolean;
+  requestText: string;
+  previousSource: string;
+} {
+  const applied = appliedSource.trim();
+  if (!applied || !snapshot.startsWith(applied)) {
+    return { incremental: false, requestText: snapshot, previousSource: "" };
+  }
+  const delta = snapshot.slice(applied.length).trim();
+  if (!delta) {
+    return { incremental: false, requestText: snapshot, previousSource: "" };
+  }
+  return { incremental: true, requestText: delta, previousSource: applied };
+}
+
+function composeIncrementalTranslation(base: string, next: string): string {
+  const a = base.trim();
+  const b = next.trim();
+  if (!a) return b;
+  if (!b) return a;
+  if (/\s$/.test(base) || /^[,.;:!?，。！？；：、）\])}]/.test(b)) {
+    return `${a}${b}`;
+  }
+  if (/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]$/.test(a) || /^[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(b)) {
+    return `${a}${b}`;
+  }
+  return `${a} ${b}`;
+}
+
+function sourceEndsAtBoundary(text: string): boolean {
+  return /[。！？!?；;：:\n]$/.test(text.trim());
+}
+
+function shouldTranslateSourceDelta(
+  snapshot: string,
+  appliedSource: string,
+  uncommittedSince: number,
+): boolean {
+  const src = snapshot.trim();
+  if (!src || src === appliedSource.trim()) {
+    return false;
+  }
+  if (Date.now() - uncommittedSince >= TRANSLATE_MAX_LAG_MS) {
+    return true;
+  }
+  if (sourceEndsAtBoundary(src)) {
+    return true;
+  }
+  const delta = src.startsWith(appliedSource.trim())
+    ? src.slice(appliedSource.trim().length).trim()
+    : src;
+  const normalized = delta.replace(/\s+/g, "");
+  if (!normalized) {
+    return false;
+  }
+  if (/^[\x00-\x7F]+$/.test(normalized)) {
+    return normalized.length >= MIN_SOURCE_DELTA_LATIN_CHARS;
+  }
+  return normalized.length >= MIN_SOURCE_DELTA_CHARS;
+}
+
+/** 读取 /api/translate/stream 的 NDJSON：{c} 多次，{ok:true} 结束，{e} 错误 */
+async function consumeTranslateNdjsonStream(
+  r: Response,
+  onDelta: (full: string) => void,
+  isStale: () => boolean,
+): Promise<void> {
+  if (!r.body) {
+    throw new Error("无响应体");
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buffer = "";
+  let accum = "";
+  let sawOk = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (isStale()) {
+      return;
+    }
+    if (done) {
+      break;
+    }
+    buffer += dec.decode(value, { stream: true });
+    for (;;) {
+      const ix = buffer.indexOf("\n");
+      if (ix < 0) {
+        break;
+      }
+      const line = buffer.slice(0, ix);
+      buffer = buffer.slice(ix + 1);
+      if (!line.trim()) {
+        continue;
+      }
+      let o: { c?: string; e?: string; ok?: boolean };
+      try {
+        o = JSON.parse(line) as { c?: string; e?: string; ok?: boolean };
+      } catch {
+        throw new Error("翻译流解析失败。");
+      }
+      if (isStale()) {
+        return;
+      }
+      if (typeof o.e === "string" && o.e) {
+        throw new Error(o.e);
+      }
+      if (typeof o.c === "string") {
+        accum += o.c;
+        onDelta(accum);
+      }
+      if (o.ok === true) {
+        sawOk = true;
+        return;
+      }
+    }
+  }
+  if (buffer.trim() && !sawOk) {
+    try {
+      const o = JSON.parse(buffer) as { e?: string; ok?: boolean };
+      if (o.e) {
+        throw new Error(o.e);
+      }
+      if (o.ok === true) {
+        sawOk = true;
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message !== "翻译流解析失败。") {
+        throw e;
+      }
+    }
+  }
+  if (isStale()) {
+    return;
+  }
+  if (!sawOk) {
+    throw new Error("翻译流意外结束。");
+  }
+}
+
 export function LiveSessionPage({
   sourceLang,
   targetLang,
@@ -49,6 +249,7 @@ export function LiveSessionPage({
 }: Props) {
   const [sessionState, setSessionState] = useState<SessionState>("LIVE");
   const [translation, setTranslation] = useState("");
+  const [translationDraft, setTranslationDraft] = useState("");
   const [translationError, setTranslationError] = useState<string | null>(null);
   const [translationPending, setTranslationPending] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -58,16 +259,22 @@ export function LiveSessionPage({
   isLiveRef.current = isLive;
   const pausedAccumulatedRef = useRef(0);
   const liveSegmentStartRef = useRef<number | null>(Date.now());
-  /** 已完整对应到译区的原文前缀（仅在一次翻译成功后推进，避免逐字/逐词打 LLM） */
-  const translatedSourceAnchorRef = useRef("");
   const latestTranscriptRef = useRef("");
+  /** 与当前译文已对齐的原文；整段模式下一一对应，非前缀增量 */
+  const lastAppliedSourceRef = useRef("");
   const translateInFlightRef = useRef(false);
+  /** 当前正在请求 LLM 的原文快照；用于避免「原文仅变长」时反复 abort 流式翻译。 */
+  const translateFlightSourceRef = useRef("");
   const translateStableTimerRef = useRef<number | null>(null);
   const translateMaxLagTimerRef = useRef<number | null>(null);
   const uncommittedSinceRef = useRef<number | null>(null);
   const translationRef = useRef("");
+  const translationCommittedRef = useRef("");
+  const translationDraftRef = useRef("");
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamGenRef = useRef(0);
   const armTranslationRef = useRef<() => void>(() => {});
-  const { status: asrStatus, errorMessage: asrError, transcript, asrMode } = useLiveAsr(
+  const { status: asrStatus, errorMessage: asrError, transcript, asrMode, clearTranscript } = useLiveAsr(
     {
       enabled: isLive,
       language: sourceLang,
@@ -88,10 +295,11 @@ export function LiveSessionPage({
     isLive && (asrStatus === "connecting" || asrStatus === "listening");
   const showCaptureHintMotion = isActivelyCapturing && !hasTranscript;
 
-  const hasTranslation = Boolean(translation.trim());
+  const visibleTranslation = composeIncrementalTranslation(translation, translationDraft);
+  const hasTranslation = Boolean(visibleTranslation.trim());
   const isAsrError = isLive && asrStatus === "error";
   const translationBody =
-    translation.trim()
+    visibleTranslation.trim()
       || (isLive
         ? (hasTranscript
           ? (translationPending ? "正在翻译…" : "等待翻译")
@@ -109,29 +317,23 @@ export function LiveSessionPage({
   }, [translation]);
 
   useEffect(() => {
+    translationDraftRef.current = translationDraft;
+  }, [translationDraft]);
+
+  useEffect(() => {
+    streamAbortRef.current?.abort();
+    streamGenRef.current += 1;
     setTranslation("");
+    setTranslationDraft("");
     setTranslationError(null);
-    translatedSourceAnchorRef.current = "";
+    lastAppliedSourceRef.current = "";
+    translationCommittedRef.current = "";
     uncommittedSinceRef.current = null;
   }, [sourceLang, targetLang]);
 
   useEffect(() => {
     latestTranscriptRef.current = transcript;
   }, [transcript]);
-
-  function getPendingFromTranscript(
-    text: string,
-  ): { toTranslate: string; fullSnapshot: string } | null {
-    const t = text.trim();
-    if (!t) return null;
-    let anchor = translatedSourceAnchorRef.current;
-    if (anchor && !t.startsWith(anchor)) {
-      anchor = "";
-    }
-    const toTranslate = (anchor ? t.slice(anchor.length) : t).trim();
-    if (!toTranslate) return null;
-    return { toTranslate, fullSnapshot: t };
-  }
 
   const runTranslate = useCallback(
     async () => {
@@ -144,55 +346,202 @@ export function LiveSessionPage({
         window.clearTimeout(translateMaxLagTimerRef.current);
         translateMaxLagTimerRef.current = null;
       }
-      if (translateInFlightRef.current) return;
 
-      const pending0 = getPendingFromTranscript(latestTranscriptRef.current);
-      if (!pending0) {
+      const snapshot = latestTranscriptRef.current.trim();
+      if (!snapshot) {
         uncommittedSinceRef.current = null;
         setTranslationPending(false);
         return;
       }
-      const { toTranslate, fullSnapshot } = pending0;
+      if (snapshot === lastAppliedSourceRef.current) {
+        uncommittedSinceRef.current = null;
+        setTranslationPending(false);
+        return;
+      }
+
+      if (translateInFlightRef.current) {
+        const inflight = translateFlightSourceRef.current;
+        if (snapshot === inflight) {
+          return;
+        }
+        if (inflight && snapshot.startsWith(inflight)) {
+          return;
+        }
+      }
+
+      streamAbortRef.current?.abort();
+      const myId = ++streamGenRef.current;
+      const ac = new AbortController();
+      streamAbortRef.current = ac;
+      const sentSnapshot = snapshot;
+      const committedAtRequest = translationCommittedRef.current.trim();
+      const plan = sourceDeltaForNextRound(snapshot, lastAppliedSourceRef.current);
+      const incremental = plan.incremental && Boolean(committedAtRequest);
 
       translateInFlightRef.current = true;
+      translateFlightSourceRef.current = sentSnapshot;
       setTranslationPending(true);
-      try {
-        const r = await fetch(apiUrl("/api/translate"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: toTranslate,
-            source_language: getLangLabel(sourceLang),
-            target_language: getLangLabel(targetLang),
-          }),
-        });
-        if (!r.ok) {
-          throw new Error(await readApiError(r));
+      const previousVisibleTranslation =
+        composeIncrementalTranslation(translationRef.current, translationDraftRef.current).trim()
+        || committedAtRequest;
+      let streamed = "";
+      const translatePayload = JSON.stringify({
+        text: incremental ? plan.requestText : sentSnapshot,
+        source_language: getLangLlmName(sourceLang),
+        target_language: getLangLlmName(targetLang),
+        source_lang_code: sourceLang,
+        target_lang_code: targetLang,
+        previous_source_text: incremental ? plan.previousSource : undefined,
+        previous_translation_text: incremental ? committedAtRequest : undefined,
+      });
+      const composeResult = (next: string) =>
+        incremental ? composeIncrementalTranslation(committedAtRequest, next) : next.trim();
+      const applyNonStreamResult = async (res: Response) => {
+        if (!res.ok) {
+          throw new Error(await readApiError(res));
         }
-        const data = (await r.json()) as { translation?: string };
+        const data = (await res.json()) as { translation?: string };
         const next = (data.translation || "").trim();
-        if (next) {
-          translatedSourceAnchorRef.current = fullSnapshot;
-          setTranslation((prev) => {
-            if (!prev.trim()) return next;
-            return `${prev.trim()}\n${next}`;
-          });
+        if (myId !== streamGenRef.current) {
+          return;
+        }
+        const nowSrc = latestTranscriptRef.current.trim();
+        if (next && shouldApplyThisRound(sentSnapshot, nowSrc, next)) {
+          const composed = composeResult(next);
+          lastAppliedSourceRef.current = sentSnapshot;
+          translationCommittedRef.current = composed;
+          setTranslation(composed);
+          setTranslationDraft("");
+          setTranslationError(null);
+        } else if (next) {
+          // 不纳入已对齐的提交时，仍宜展示：优先已稳定译文，否则用本轮（避免重识别后把译区清成空）
+          setTranslation(translationCommittedRef.current.trim() || composeResult(next));
+          setTranslationDraft("");
           setTranslationError(null);
         } else {
+          setTranslation(previousVisibleTranslation);
+          setTranslationDraft("");
           setTranslationError("翻译端点未返回译文。");
         }
+      };
+
+      /**
+       * 备用：POST /api/translate 与流式在服务端同一路径（流式 /chat/completions 聚合）；
+       * 用于 404/HTTP 错、或流式体解析异常时。
+       */
+      const tryNonStreamOnly = async (): Promise<void> => {
+        const r2 = await fetch(apiUrl("/api/translate"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: translatePayload,
+          signal: ac.signal,
+        });
+        await applyNonStreamResult(r2);
+      };
+
+      try {
+        const r = await fetch(apiUrl("/api/translate/stream"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: translatePayload,
+          signal: ac.signal,
+        });
+        if (r.status === 404 || r.status === 405) {
+          void r.body?.cancel();
+          await tryNonStreamOnly();
+          return;
+        }
+        if (!r.ok) {
+          try {
+            await tryNonStreamOnly();
+            return;
+          } catch {
+            throw new Error(await readApiError(r));
+          }
+        }
+        await consumeTranslateNdjsonStream(
+          r,
+          (full) => {
+            if (myId !== streamGenRef.current) {
+              return;
+            }
+            streamed = full;
+            if (full.trim()) {
+              if (incremental) {
+                setTranslationDraft(full.trim());
+              } else {
+                setTranslationDraft(composeResult(full));
+              }
+              setTranslationError(null);
+            }
+          },
+          () => myId !== streamGenRef.current,
+        );
+        if (myId !== streamGenRef.current) {
+          return;
+        }
+        const nowSrc = latestTranscriptRef.current.trim();
+        const done = streamed.trim();
+        if (done && shouldApplyThisRound(sentSnapshot, nowSrc, done)) {
+          const composed = composeResult(done);
+          lastAppliedSourceRef.current = sentSnapshot;
+          translationCommittedRef.current = composed;
+          setTranslation(composed);
+          setTranslationDraft("");
+          setTranslationError(null);
+        } else if (done) {
+          setTranslation(translationCommittedRef.current.trim() || composeResult(done));
+          setTranslationDraft("");
+          setTranslationError(null);
+        } else {
+          setTranslation(previousVisibleTranslation);
+          setTranslationDraft("");
+          setTranslationError(null);
+        }
       } catch (error) {
+        const aborted = error instanceof DOMException && error.name === "AbortError"
+          || (error instanceof Error && error.name === "AbortError");
+        if (aborted) {
+          if (myId !== streamGenRef.current) {
+            return;
+          }
+          setTranslation(previousVisibleTranslation || composeResult(streamed));
+          setTranslationDraft("");
+          return;
+        }
         const message = error instanceof Error ? error.message : "翻译失败";
-        if (!translationRef.current.trim()) {
-          setTranslationError(message);
+        if (myId === streamGenRef.current) {
+          let fallbackMessage: string | null = null;
+          try {
+            await tryNonStreamOnly();
+            return;
+          } catch (e2) {
+            fallbackMessage = e2 instanceof Error ? e2.message : String(e2);
+          }
+          setTranslation(previousVisibleTranslation || composeResult(streamed));
+          setTranslationDraft("");
+          if (isEmptyTranslationStreamMessage(fallbackMessage)) {
+            setTranslationError(null);
+            return;
+          }
+          setTranslationError(
+            enrichTranslationErrorDetail(
+              mergeStreamAndTranslateFallbackError(message, fallbackMessage),
+            ),
+          );
         }
       } finally {
-        translateInFlightRef.current = false;
+        if (myId === streamGenRef.current) {
+          translateInFlightRef.current = false;
+          translateFlightSourceRef.current = "";
+        }
         uncommittedSinceRef.current = null;
         armTranslationRef.current();
-        const after = getPendingFromTranscript(latestTranscriptRef.current);
-        if (!after) {
-          setTranslationPending(false);
+        const latest = latestTranscriptRef.current.trim();
+        if (myId === streamGenRef.current) {
+          if (!latest || latest === lastAppliedSourceRef.current) {
+            setTranslationPending(false);
+          }
         }
       }
     },
@@ -219,9 +568,7 @@ export function LiveSessionPage({
       uncommittedSinceRef.current = null;
       return;
     }
-
-    const pending = getPendingFromTranscript(text);
-    if (!pending) {
+    if (text === lastAppliedSourceRef.current) {
       uncommittedSinceRef.current = null;
       return;
     }
@@ -250,10 +597,7 @@ export function LiveSessionPage({
     }
     const text = transcript.trim();
     if (!text) {
-      setTranslation("");
-      setTranslationError(null);
       setTranslationPending(false);
-      translatedSourceAnchorRef.current = "";
       uncommittedSinceRef.current = null;
       clearTranslateTimers();
       return;
@@ -328,6 +672,29 @@ export function LiveSessionPage({
     a.click();
     URL.revokeObjectURL(url);
   }, [sourceLang, targetLang, transcript, translation]);
+
+  const clearSession = useCallback(() => {
+    streamAbortRef.current?.abort();
+    streamGenRef.current += 1;
+    translateInFlightRef.current = false;
+    translateFlightSourceRef.current = "";
+    if (translateStableTimerRef.current != null) {
+      window.clearTimeout(translateStableTimerRef.current);
+      translateStableTimerRef.current = null;
+    }
+    if (translateMaxLagTimerRef.current != null) {
+      window.clearTimeout(translateMaxLagTimerRef.current);
+      translateMaxLagTimerRef.current = null;
+    }
+    clearTranscript();
+    latestTranscriptRef.current = "";
+    lastAppliedSourceRef.current = "";
+    translationCommittedRef.current = "";
+    uncommittedSinceRef.current = null;
+    setTranslation("");
+    setTranslationError(null);
+    setTranslationPending(false);
+  }, [clearTranscript]);
 
   const sourceName = getLangLabel(sourceLang);
   const targetName = getLangLabel(targetLang);
@@ -453,6 +820,14 @@ export function LiveSessionPage({
             className="order-2 rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 sm:order-none"
           >
             导出
+          </button>
+          <button
+            type="button"
+            onClick={clearSession}
+            className="order-2 rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-600 shadow-sm transition hover:border-amber-200 hover:bg-amber-50/80 hover:text-amber-900 sm:order-none"
+            title="清空当前已录入的原文与译文，不影响暂停/继续与麦克风"
+          >
+            清空
           </button>
           <div className="order-3 flex w-full items-center justify-center gap-2 sm:order-none sm:w-auto">
             <button

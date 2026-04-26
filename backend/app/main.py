@@ -3,12 +3,17 @@
 import asyncio
 import json
 import os
-from typing import Any, Dict, Optional
+import queue
+import threading
+import time
+from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
 
-import httpx
+import requests
+from requests import exceptions as req_exc
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.asr_service import is_asr_importable, transcribe_int16_16k_mono
@@ -17,7 +22,59 @@ from app.llm_settings import key_tail_for_display, load_raw, save_raw
 _API_PREFIX = "/api"
 
 _LLM_TEST_UA = "realtime-translate/0.1 (llm-test)"
-_LLM_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _llm_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _requests_timeout_connect_read(*, stream: bool) -> tuple[float, float]:
+    """requests 的 (connect, read)。流式时 read 为「相邻两次收到数据之间的最大间隔」（慢模型首 token）。"""
+    connect = _llm_env_float("RT_LLM_CONNECT_TIMEOUT", 60.0)
+    if stream:
+        read_gap = _llm_env_float("RT_LLM_STREAM_READ_TIMEOUT", 600.0)
+        return (connect, read_gap)
+    read_total = _llm_env_float("RT_LLM_READ_TIMEOUT", 300.0)
+    return (connect, read_total)
+
+
+def _llm_verify_tls() -> bool:
+    return os.getenv("RT_LLM_SSL_VERIFY", "").strip().lower() not in ("0", "false", "no")
+
+
+def _requests_verify_and_proxies() -> tuple[Any, Optional[Dict[str, str]]]:
+    """verify 与可选代理；显式 RT_LLM_HTTPS_PROXY / RT_LLM_HTTP_PROXY 优先于 urllib3 从环境推断。"""
+    verify = _llm_verify_tls()
+    https_p = os.getenv("RT_LLM_HTTPS_PROXY", "").strip()
+    http_p = os.getenv("RT_LLM_HTTP_PROXY", "").strip()
+    if https_p or http_p:
+        proxies: dict[str, str] = {}
+        if http_p:
+            proxies["http"] = http_p
+        if https_p:
+            proxies["https"] = https_p
+        elif http_p:
+            proxies["https"] = http_p
+        return verify, proxies
+    return verify, None
+
+
+def _llm_stream_net_err_message(exc: BaseException) -> str:
+    """部分异常 str 为空，避免界面只显示冒号后无内容。"""
+    raw = str(exc).strip()
+    extra = f"{type(exc).__name__}" + (f": {raw[:200]}" if raw else f": {repr(exc)[:200]}")
+    hint = (
+        "请核对「设置」中的 Base URL；若走系统代理可设 RT_LLM_HTTPS_PROXY；"
+        "流式慢可提高 RT_LLM_STREAM_READ_TIMEOUT（相邻数据间隔秒数，默认 600）；"
+        "非流式可提高 RT_LLM_READ_TIMEOUT。"
+    )
+    return f"无法连接语言模型或等待超时（{extra[:220]}）。{hint}"
 
 
 def _llm_upstream_error_snippet(parsed: Any) -> str:
@@ -54,31 +111,6 @@ def _log_translate_failure(status_code: int, detail: str, model: str, text: str)
 
 
 app = FastAPI(title="Realtime Translate API", version="0.1.0")
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    global _LLM_CLIENT
-    ssl_verify = os.getenv("RT_LLM_SSL_VERIFY", "").strip().lower() not in ("0", "false", "no")
-    _LLM_CLIENT = httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=8.0),
-        verify=ssl_verify,
-        limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
-    )
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    global _LLM_CLIENT
-    if _LLM_CLIENT is not None:
-        await _LLM_CLIENT.aclose()
-        _LLM_CLIENT = None
-
-
-def _llm_client() -> httpx.AsyncClient:
-    if _LLM_CLIENT is None:
-        raise HTTPException(status_code=503, detail="语言模型连接池未就绪，请稍后重试。")
-    return _LLM_CLIENT
 
 _origins_env = os.getenv("CORS_ORIGINS", "").strip()
 if _origins_env:
@@ -123,6 +155,8 @@ def health() -> Dict[str, Any]:
         "llm_settings": True,
         # 含 POST /api/settings/llm/test；旧进程无此字段
         "llm_test": True,
+        # 当前进程翻译走 requests/urllib3；无此字段多为未重启的旧 API
+        "llm_translate": "requests",
     }
 
 
@@ -141,10 +175,56 @@ class LlmSettingsIn(BaseModel):
     api_key: str = Field(default="")
 
 
+# UI 中文名 / 与前端 code 的别名 → 无歧义英文，提高翻译模型对目标语遵从度
+_LLM_LABEL_ALIASES: Dict[str, str] = {
+    "auto": "auto-detect",
+    "自动检测": "auto-detect",
+    "en": "English",
+    "英语": "English",
+    "zh": "Simplified Chinese",
+    "中文": "Simplified Chinese",
+    "ja": "Japanese",
+    "日语": "Japanese",
+    "ko": "Korean",
+    "韩语": "Korean",
+}
+
+
+def _llm_source_label(raw: str) -> str:
+    s = (raw or "auto").strip() or "auto"
+    return _LLM_LABEL_ALIASES.get(s, s)
+
+
+def _llm_target_label(raw: str) -> str:
+    s = (raw or "").strip()
+    return _LLM_LABEL_ALIASES.get(s, s)
+
+
+# 与前端 LANGS value 一致，供提示词锁脚本 / BCP-47
+_LANG_TO_BCP47: Dict[str, str] = {
+    "en": "en",
+    "zh": "zh-Hans",
+    "ja": "ja",
+    "ko": "ko",
+    "auto": "",
+}
+
+
+def _bcp47_from_code(code: Optional[str]) -> str:
+    c = (code or "").strip()
+    if c in ("", "auto"):
+        return ""
+    return _LANG_TO_BCP47.get(c, c)
+
+
 class TranslateIn(BaseModel):
     text: str = Field(min_length=1, max_length=20000)
     source_language: str = Field(default="auto", max_length=80)
     target_language: str = Field(min_length=1, max_length=80)
+    source_lang_code: Optional[str] = Field(default=None, max_length=20)
+    target_lang_code: Optional[str] = Field(default=None, max_length=20)
+    previous_source_text: Optional[str] = Field(default=None, max_length=4000)
+    previous_translation_text: Optional[str] = Field(default=None, max_length=4000)
 
 
 class TranslateOut(BaseModel):
@@ -213,7 +293,8 @@ def test_llm_settings(body: LlmSettingsIn) -> Dict[str, Any]:
         )
     final_key = new_key if new_key else old_key
     base = b.rstrip("/")
-    ssl_verify = os.getenv("RT_LLM_SSL_VERIFY", "").strip().lower() not in ("0", "false", "no")
+    verify, proxies = _requests_verify_and_proxies()
+    to = _requests_timeout_connect_read(stream=False)
     headers = {
         "Authorization": f"Bearer {final_key}",
         "Content-Type": "application/json",
@@ -221,59 +302,67 @@ def test_llm_settings(body: LlmSettingsIn) -> Dict[str, Any]:
         "User-Agent": _LLM_TEST_UA,
     }
     try:
-        with httpx.Client(timeout=25.0, verify=ssl_verify) as client:
-            models_r = client.get(f"{base}/models", headers=headers)
-            models_parsed: Any
-            try:
-                models_parsed = models_r.json()
-            except (json.JSONDecodeError, TypeError, ValueError):
-                models_parsed = None
-            models_err = _llm_upstream_error_snippet(models_parsed)
-            if 200 <= models_r.status_code < 300 and not models_err:
-                model_ids = _parse_model_ids(models_parsed)
-                if not model_ids:
-                    return {"ok": True, "message": "连接成功，端点与 Key 有效。"}
-                if m in model_ids:
-                    return {"ok": True, "message": "连接成功，模型可用。"}
-                preview = "、".join(model_ids[:8])
-                more = " 等" if len(model_ids) > 8 else ""
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"端点与 Key 有效，但模型列表中未找到 {m}。可用模型示例：{preview}{more}",
-                )
-            if models_r.status_code in (401, 403):
-                if models_err:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Key 或权限无效（HTTP {models_r.status_code}）：{models_err}",
-                    )
-                raise HTTPException(
-                    status_code=400,
-                    detail="Key 或权限无效（HTTP 401/403）。",
-                )
-
-            # Some OpenAI-compatible gateways do not expose /models. Fall back to
-            # a minimal chat request only when model listing is unavailable.
-            r = client.post(
-                f"{base}/chat/completions",
-                headers=headers,
-                json={
-                    "model": m,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 8,
-                },
+        models_r = requests.get(
+            f"{base}/models",
+            headers=headers,
+            timeout=to,
+            verify=verify,
+            proxies=proxies,
+        )
+        models_parsed: Any
+        try:
+            models_parsed = models_r.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            models_parsed = None
+        models_err = _llm_upstream_error_snippet(models_parsed)
+        if 200 <= models_r.status_code < 300 and not models_err:
+            model_ids = _parse_model_ids(models_parsed)
+            if not model_ids:
+                return {"ok": True, "message": "连接成功，端点与 Key 有效。"}
+            if m in model_ids:
+                return {"ok": True, "message": "连接成功，模型可用。"}
+            preview = "、".join(model_ids[:8])
+            more = " 等" if len(model_ids) > 8 else ""
+            raise HTTPException(
+                status_code=400,
+                detail=f"端点与 Key 有效，但模型列表中未找到 {m}。可用模型示例：{preview}{more}",
             )
-    except httpx.ConnectError as exc:
+        if models_r.status_code in (401, 403):
+            if models_err:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Key 或权限无效（HTTP {models_r.status_code}）：{models_err}",
+                )
+            raise HTTPException(
+                status_code=400,
+                detail="Key 或权限无效（HTTP 401/403）。",
+            )
+
+        # Some OpenAI-compatible gateways do not expose /models. Fall back to
+        # a minimal chat request only when model listing is unavailable.
+        r = requests.post(
+            f"{base}/chat/completions",
+            headers=headers,
+            json={
+                "model": m,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 8,
+            },
+            timeout=to,
+            verify=verify,
+            proxies=proxies,
+        )
+    except req_exc.ConnectionError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"无法连接：{str(exc)[:200]}",
         ) from exc
-    except httpx.TimeoutException as exc:
+    except req_exc.Timeout as exc:
         raise HTTPException(
             status_code=400,
             detail="请求超时，请检查网络与 Base URL。",
         ) from exc
-    except httpx.HTTPError as exc:
+    except req_exc.RequestException as exc:
         raise HTTPException(
             status_code=400,
             detail=f"请求失败：{str(exc)[:200]}",
@@ -310,8 +399,7 @@ def test_llm_settings(body: LlmSettingsIn) -> Dict[str, Any]:
     raise HTTPException(status_code=400, detail=msg)
 
 
-@app.post(f"{_API_PREFIX}/translate", response_model=TranslateOut)
-async def translate_text(body: TranslateIn) -> TranslateOut:
+def _load_llm_config_for_translate() -> tuple[str, str, str]:
     raw = load_raw()
     base_url = (raw.get("base_url") or "").strip().rstrip("/")
     model = (raw.get("model") or "").strip()
@@ -326,93 +414,643 @@ async def translate_text(body: TranslateIn) -> TranslateOut:
             status_code=400,
             detail="已保存的 Base URL 无效，请在设置中检查。",
         )
+    return base_url, model, api_key
 
-    src = (body.source_language or "auto").strip() or "auto"
+
+def _openai_translate_request_json(
+    body: TranslateIn,
+    model: str,
+    *,
+    stream: bool,
+) -> Dict[str, Any]:
+    src = _llm_source_label(body.source_language)
     tgt = (body.target_language or "").strip()
+    tgt = _llm_target_label(tgt) if tgt else tgt
     text = (body.text or "").strip()
+    previous_source = (body.previous_source_text or "").strip()
+    previous_translation = (body.previous_translation_text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="没有可翻译的原文。")
+    if not tgt:
+        raise HTTPException(status_code=400, detail="没有目标语言。")
 
-    max_tokens = min(220, max(48, len(text) * 3 + 24))
+    tgt_bcp = _bcp47_from_code(body.target_lang_code)
+    src_bcp = _bcp47_from_code(body.source_lang_code)
+    _parts: List[str] = []
+    if src_bcp:
+        _parts.append(f"Source BCP-47: {src_bcp}.")
+    if tgt_bcp:
+        _parts.append(
+            f"Target BCP-47: {tgt_bcp}. The entire output must be in that language and script, "
+            "including one-word or sentence fragments, not the source."
+        )
+    locale_block = " ".join(_parts) if _parts else ""
+    zh_extra = (
+        "For Simplified Chinese, use standard Mainland Simplified characters only; "
+        "do not leave body text in English or the source language. "
+        if (body.target_lang_code or "").strip() == "zh" or "Simplified Chinese" in tgt
+        else ""
+    )
+    # 实时翻译的首 token 延迟很敏感。短片段不应申请 1024+ token，
+    # 否则部分兼容网关/推理模型会显著放慢调度或首包。
+    if stream:
+        max_tokens = min(2048, max(96, int(len(text) * 1.6) + 64))
+    else:
+        max_tokens = min(4096, max(256, int(len(text) * 1.6) + 128))
+    context_block = ""
+    translate_instruction = (
+        "Translate the full block below. Even short or incomplete phrases must be fully in the target language."
+    )
+    if previous_source or previous_translation:
+        context_bits: list[str] = []
+        if previous_source:
+            context_bits.append(f"Previous source context:\n{previous_source[-1800:]}")
+        if previous_translation:
+            context_bits.append(f"Previous target-language translation context:\n{previous_translation[-1800:]}")
+        context_block = "\n\n".join(context_bits)
+        translate_instruction = (
+            "Use the previous context only for continuity. Translate ONLY the current source block below; "
+            "do not repeat or revise the previous translation."
+        )
+    return {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a live interpreter. Translate the user text. "
+                    "The answer language must be ONLY the target language, including single words, "
+                    "fragments, and numbers written as that language would normally write them, "
+                    "not left in the source. "
+                    "If the user text is already in the target language, return it with minimal edits. "
+                    f"{zh_extra} "
+                    "No headings, no quotes around the result, no explanations, no markdown. "
+                    "Output plain translated text only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Source: {src}\n"
+                    f"Target: {tgt}\n"
+                    f"{(locale_block + chr(10)) if locale_block else ''}"
+                    f"{(context_block + chr(10) + chr(10)) if context_block else ''}"
+                    f"{translate_instruction}\n\n"
+                    f"Current source block:\n{text}"
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+
+
+def _ndjson_error_line(message: str) -> bytes:
+    return (json.dumps({"e": message}, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _openai_content_to_str(content: Any) -> str:
+    """将 OpenAI/兼容端的 message 或 delta .content 规范为可拼接的文本；支持 str 或 content parts 列表。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        t = content.get("text")
+        if isinstance(t, str) and t:
+            return t
+        c0 = content.get("content")
+        if isinstance(c0, str) and c0:
+            return c0
+        if c0 is not None:
+            return _openai_content_to_str(c0)
+        p = content.get("parts")
+        if p is not None:
+            return _openai_content_to_str(p)
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                it = item.get("type", "")
+                if it in ("tool_calls", "tool_call", "refusal", "refusals", "function_call", "file_ref"):
+                    continue
+                t = item.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
+                c2 = item.get("content")
+                if isinstance(c2, str) and c2:
+                    parts.append(c2)
+                elif c2 is not None:
+                    s = _openai_content_to_str(c2)
+                    if s:
+                        parts.append(s)
+        return "".join(parts)
+    return ""
+
+
+def _text_from_stream_chunk_choice(ch: Any) -> str:
+    """从流式单帧 choices[] 中取出助手文本；兼容 string / 数组 content、delta.text、末帧 message。"""
+    if not isinstance(ch, dict):
+        return ""
+    delta = ch.get("delta")
+    if isinstance(delta, dict):
+        s = _openai_content_to_str(delta.get("content"))
+        if s:
+            return s
+        t = delta.get("text")
+        if isinstance(t, str) and t:
+            return t
+        ot = delta.get("output_text")
+        if isinstance(ot, str) and ot:
+            return ot
+    message = ch.get("message")
+    if isinstance(message, dict):
+        s2 = _openai_content_to_str(message.get("content"))
+        if s2:
+            return s2
+    if isinstance(ch.get("text"), str) and ch["text"]:
+        return ch["text"]
+    return ""
+
+
+def _text_from_stream_chunk_candidate(gem: Any) -> str:
+    """
+    兼容流式里 candidates[]（如部分 Gemini/Vertex 封装）、content.parts 等形态；
+    先按 OpenAI choice 解析，再尝试嵌套 content。
+    """
+    if not isinstance(gem, dict):
+        return ""
+    t0 = _text_from_stream_chunk_choice(gem)
+    if t0:
+        return t0
+    c = gem.get("content")
+    if isinstance(c, str) and c.strip():
+        return c
+    if isinstance(c, dict):
+        t1 = _openai_content_to_str(c.get("parts") or c.get("content") or c)
+        if t1:
+            return t1
+    return ""
+
+
+def _iter_openai_stream_chunk_pieces(
+    j: Any,
+) -> tuple[Optional[bytes], list[str]]:
+    """
+    解析一帧 data 或裸行 JSON。返回 (error_ndjson, text_pieces)：
+    error 非空时应终止整个流；否则 pieces 中每项输出为 {\"c\":...}。
+    """
+    if not isinstance(j, dict):
+        return (None, [])
+    err_obj = j.get("error", None)
+    if err_obj is not None and err_obj is not False and not (j.get("choices") or j.get("candidates") or j.get("output")):
+        em = (err_obj or {}).get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
+        return (_ndjson_error_line(str(em)[:400]), [])
+
+    pieces: list[str] = []
+    event_type = j.get("type")
+    if isinstance(event_type, str) and event_type in (
+        "response.output_text.delta",
+        "response.refusal.delta",
+        "content_block_delta",
+        "message_delta",
+    ):
+        delta = j.get("delta")
+        if isinstance(delta, str) and delta:
+            pieces.append(delta)
+        elif isinstance(delta, dict):
+            delta_text = _openai_content_to_str(
+                delta.get("text")
+                or delta.get("content")
+                or delta.get("output_text")
+                or delta,
+            )
+            if delta_text:
+                pieces.append(delta_text)
+    for ch in j.get("choices") or []:
+        if not isinstance(ch, dict):
+            continue
+        piece = _text_from_stream_chunk_choice(ch)
+        if piece:
+            pieces.append(piece)
+    for gem in j.get("candidates") or []:
+        t = _text_from_stream_chunk_candidate(gem)
+        if t:
+            pieces.append(t)
+    if not pieces:
+        out = j.get("output")
+        if isinstance(out, dict):
+            for ch2 in (out.get("choices") or out.get("candidates") or []):
+                if not isinstance(ch2, dict):
+                    continue
+                p2 = _text_from_stream_chunk_choice(ch2) or _text_from_stream_chunk_candidate(ch2)
+                if p2:
+                    pieces.append(p2)
+            t_out = out.get("text")
+            if not pieces and isinstance(t_out, str) and t_out:
+                pieces.append(t_out)
+    if not pieces:
+        # 少数实现/代理在流中直接给顶层 message，不套 choices
+        top_msg = j.get("message")
+        if isinstance(top_msg, dict):
+            t3 = _openai_content_to_str(top_msg.get("content"))
+            if t3:
+                pieces.append(t3)
+        elif isinstance(top_msg, str) and top_msg:
+            pieces.append(top_msg)
+        t_resp = j.get("response")
+        if not pieces and isinstance(t_resp, str) and t_resp:
+            pieces.append(t_resp)
+    if not pieces:
+        top_delta = j.get("delta")
+        if isinstance(top_delta, str) and top_delta:
+            pieces.append(top_delta)
+        elif isinstance(top_delta, dict):
+            t_delta = _openai_content_to_str(
+                top_delta.get("text")
+                or top_delta.get("content")
+                or top_delta.get("output_text")
+                or top_delta,
+            )
+            if t_delta:
+                pieces.append(t_delta)
+    if not pieces:
+        for key in ("content", "text", "output_text"):
+            val = j.get(key)
+            if isinstance(val, str) and val:
+                pieces.append(val)
+                break
+            if isinstance(val, (dict, list)):
+                t_val = _openai_content_to_str(val)
+                if t_val:
+                    pieces.append(t_val)
+                    break
+    return (None, pieces)
+
+
+def _iter_ndjson_bytes_from_sse_lines(
+    lines: Iterable[str],
+    *,
+    empty_ok: bool = True,
+) -> Iterator[bytes]:
+    """将上游 OpenAI 式 SSE 文本行（含裸 JSON 错误行）转为 NDJSON：{\"c\"}… / {\"ok\":true} / {\"e\"}。"""
+    out_any = False
+    data_prefix = "data: "
+    for line_s in lines:
+        if not line_s or not line_s.strip():
+            continue
+        if line_s[0] == "\ufeff":
+            line_s = line_s[1:]
+        j: Any = None
+        if line_s.startswith("data: "):
+            data = line_s[len(data_prefix) :].strip()
+            if data == "[DONE]":
+                break
+            try:
+                j = json.loads(data)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        elif line_s.startswith("data:"):
+            data = line_s[5:].lstrip()
+            if data == "[DONE]":
+                break
+            try:
+                j = json.loads(data)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        else:
+            # 部分网关在流里直接输出与 OpenAI 相同语义的**裸 JSON 行**（无 "data: " 前缀）；
+            # 旧实现一律 continue，导致收不到任何 delta，误以为「流未返回内容」。
+            ls = line_s.strip()
+            if not ls.startswith("{"):
+                continue
+            try:
+                jbare: Any = json.loads(ls)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            j = jbare
+
+        if j is None:
+            continue
+        err_line, pieces = _iter_openai_stream_chunk_pieces(j)
+        if err_line is not None:
+            yield err_line
+            return
+        for piece in pieces:
+            out_any = True
+            yield (json.dumps({"c": piece}, ensure_ascii=False) + "\n").encode("utf-8")
+    if not out_any:
+        # 上游偶发只发 role/finish 帧或空流。实时翻译里这不是致命错误：
+        # 流式展示路径需要把它暴露为错误，让前端立即走非流式兜底，避免重复空等。
+        if empty_ok:
+            yield (json.dumps({"ok": True}, ensure_ascii=False) + "\n").encode("utf-8")
+        else:
+            yield _ndjson_error_line("翻译流未返回内容。")
+        return
+    yield (json.dumps({"ok": True}, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _llm_requests_post_chat(
+    base_url: str,
+    headers: dict[str, str],
+    json_body: Dict[str, Any],
+    *,
+    stream: bool,
+) -> requests.Response:
+    """POST /chat/completions；用 urllib3/requests，对部分网关比 httpx 更稳；连接失败时短暂重试。"""
+    verify, proxies = _requests_verify_and_proxies()
+    timeout = _requests_timeout_connect_read(stream=stream)
+    url = f"{base_url}/chat/completions"
+    last_exc: Optional[BaseException] = None
+    for attempt in range(3):
+        try:
+            return requests.post(
+                url,
+                headers=headers,
+                json=json_body,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                proxies=proxies,
+            )
+        except (req_exc.ConnectionError, req_exc.Timeout) as exc:
+            last_exc = exc
+            time.sleep(0.35 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("unreachable")
+
+
+def _sse_lines_from_requests_stream(r: requests.Response) -> Iterator[str]:
+    # requests 默认 chunk_size=512，会把很多很小的 SSE delta 缓冲到 512 字节后才交给 iter_lines。
+    # 对实时字幕而言这会直接表现为“流式很慢”，这里用 1 字节换最低首包/逐 token 延迟。
+    for line in r.iter_lines(chunk_size=1, decode_unicode=True):
+        if line and str(line).strip():
+            yield str(line)
+
+
+def _sync_translate_stream_producer(body: TranslateIn, out_q: "queue.Queue[Optional[bytes]]") -> None:
+    """在线程内用 requests 流式读 SSE（urllib3），规避部分环境下 httpx 超时/空异常。"""
     try:
-        r = await _llm_client().post(
-            f"{base_url}/chat/completions",
+        base_url, model, api_key = _load_llm_config_for_translate()
+        req = _openai_translate_request_json(body, model, stream=True)
+    except HTTPException as exc:
+        d = exc.detail
+        msg = d if isinstance(d, str) else "请求无效"
+        out_q.put(_ndjson_error_line(str(msg)[:500]))
+        out_q.put(None)
+        return
+    tlog = (body.text or "").strip()[:200]
+    robj: Optional[requests.Response] = None
+    try:
+        robj = _llm_requests_post_chat(
+            base_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "User-Agent": "realtime-translate/0.1 (translate-stream)",
+            },
+            json_body=req,
+            stream=True,
+        )
+        if robj.status_code < 200 or robj.status_code >= 300:
+            body_text = (robj.text or "")[:800]
+            parsed_err: Any = None
+            try:
+                parsed_err = json.loads(body_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            err_snip = (
+                _llm_upstream_error_snippet(parsed_err) if isinstance(parsed_err, dict) else ""
+            )
+            detail = err_snip or body_text[:200]
+            _log_translate_failure(robj.status_code, detail, model, tlog)
+            out_q.put(
+                _ndjson_error_line(
+                    f"翻译端点返回 HTTP {robj.status_code}：{detail}"[:500],
+                ),
+            )
+            out_q.put(None)
+            return
+        for chunk in _iter_ndjson_bytes_from_sse_lines(
+            _sse_lines_from_requests_stream(robj),
+            empty_ok=False,
+        ):
+            out_q.put(chunk)
+    except (req_exc.ConnectionError, req_exc.Timeout) as exc:
+        out_q.put(_ndjson_error_line(_llm_stream_net_err_message(exc)[:500]))
+    except req_exc.RequestException as exc:
+        out_q.put(_ndjson_error_line(f"翻译流失败：{str(exc)[:200]}"))
+    except Exception as exc:  # noqa: BLE001
+        out_q.put(_ndjson_error_line(f"翻译流异常：{str(exc)[:200]}"))
+    finally:
+        if robj is not None:
+            try:
+                robj.close()
+            except Exception:
+                pass
+        out_q.put(None)
+
+
+async def _translate_stream_generator(body: TranslateIn) -> AsyncIterator[bytes]:
+    out_q: queue.Queue[Optional[bytes]] = queue.Queue()
+    worker = threading.Thread(
+        target=_sync_translate_stream_producer,
+        args=(body, out_q),
+        daemon=True,
+        name="translate-stream",
+    )
+    worker.start()
+    try:
+        while True:
+            item = await asyncio.to_thread(out_q.get)
+            if item is None:
+                break
+            yield item
+    finally:
+        worker.join(timeout=60.0)
+
+
+@app.post(f"{_API_PREFIX}/translate/stream")
+async def translate_text_stream(body: TranslateIn) -> StreamingResponse:
+    return StreamingResponse(
+        _translate_stream_generator(body),
+        media_type="application/x-ndjson; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sync_translate_accumulate_via_stream(body: TranslateIn) -> str:
+    """
+    与 /translate/stream 相同：发流式 /chat/completions，经 NDJSON 聚合为整段字符串。
+    /api/translate 也仅走本函数，与浏览器侧流式展示共用同一套解析，避免多路径偏差。
+    """
+    base_url, model, api_key = _load_llm_config_for_translate()
+    tlog = (body.text or "").strip()[:200]
+    jreq = _openai_translate_request_json(body, model, stream=True)
+    r: Optional[requests.Response] = None
+    try:
+        r = _llm_requests_post_chat(
+            base_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "User-Agent": "realtime-translate/0.1 (translate-fallback-stream)",
+            },
+            json_body=jreq,
+            stream=True,
+        )
+        if r.status_code < 200 or r.status_code >= 300:
+            body_text = (r.text or "")[:800]
+            parsed_err: Any = None
+            try:
+                parsed_err = json.loads(body_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            err_snip = (
+                _llm_upstream_error_snippet(parsed_err) if isinstance(parsed_err, dict) else ""
+            )
+            detail = err_snip or body_text[:200]
+            _log_translate_failure(r.status_code, detail, model, tlog)
+            return ""
+        accum: list[str] = []
+        for block in _iter_ndjson_bytes_from_sse_lines(_sse_lines_from_requests_stream(r)):
+            for line in block.decode("utf-8").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                o: Any
+                try:
+                    o = json.loads(s)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                if o.get("e"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=str(o.get("e", "翻译流未返回内容。"))[:500],
+                    )
+                if o.get("ok") is True:
+                    break
+                c = o.get("c")
+                if isinstance(c, str) and c:
+                    accum.append(c)
+        return "".join(accum).strip()
+    except HTTPException:
+        raise
+    except (req_exc.ConnectionError, req_exc.Timeout) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"流式回退：无法连接或超时 {str(exc)[:200]}",
+        ) from exc
+    except req_exc.RequestException as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"流式回退：请求失败 {str(exc)[:200]}",
+        ) from exc
+    finally:
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+
+def _sync_translate_post_request(body: TranslateIn) -> TranslateOut:
+    """非流式翻译兜底：当上游流式偶发空帧时，保留一条稳定 JSON 路径。"""
+    base_url, model, api_key = _load_llm_config_for_translate()
+    tlog = (body.text or "").strip()[:200]
+    req = _openai_translate_request_json(body, model, stream=False)
+    try:
+        r = _llm_requests_post_chat(
+            base_url,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "realtime-translate/0.1 (translate)",
+                "User-Agent": "realtime-translate/0.1 (translate-json)",
             },
-            json={
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Translate into the target language. "
-                            "Return only the translation. No explanations, markdown, or quotes."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Source language: {src}\n"
-                            f"Target language: {tgt}\n\n"
-                            f"Text:\n{text}"
-                        ),
-                    },
-                ],
-                "temperature": 0,
-                "max_tokens": max_tokens,
-            },
+            json_body=req,
+            stream=False,
         )
-    except httpx.ConnectError as exc:
+    except (req_exc.ConnectionError, req_exc.Timeout) as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"无法连接语言模型端点：{str(exc)[:200]}",
+            detail=f"无法连接或超时：{str(exc)[:200]}",
         ) from exc
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="翻译请求超时，请检查网络或模型响应速度。",
-        ) from exc
-    except httpx.HTTPError as exc:
+    except req_exc.RequestException as exc:
         raise HTTPException(
             status_code=400,
             detail=f"翻译请求失败：{str(exc)[:200]}",
         ) from exc
 
+    body_text = (r.text or "")[:2000]
     try:
         parsed: Any = r.json()
-    except (json.JSONDecodeError, TypeError, ValueError):
-        parsed = None
-    err_snip = _llm_upstream_error_snippet(parsed) if parsed is not None else ""
-    if not (200 <= r.status_code < 300):
-        detail = err_snip or (r.text or "")[:200]
-        _log_translate_failure(r.status_code, detail, model, text)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="翻译端点返回了非 JSON 响应。") from exc
+
+    err_snip = _llm_upstream_error_snippet(parsed)
+    if r.status_code < 200 or r.status_code >= 300 or err_snip:
+        detail = err_snip or body_text[:300]
+        _log_translate_failure(r.status_code, detail, model, tlog)
         raise HTTPException(
             status_code=400,
-            detail=f"翻译端点返回 HTTP {r.status_code}{f'：{detail}' if detail else ''}",
+            detail=f"翻译端点返回 HTTP {r.status_code}：{detail}"[:500],
         )
-    if err_snip:
-        _log_translate_failure(r.status_code, err_snip, model, text)
-        raise HTTPException(status_code=400, detail=f"翻译端点返回错误：{err_snip}")
-    if not isinstance(parsed, dict):
-        raise HTTPException(status_code=400, detail="翻译端点返回了非 JSON 响应。")
-    choices = parsed.get("choices")
-    content = ""
-    if isinstance(choices, list) and choices:
-        first = choices[0]
-        if isinstance(first, dict):
-            message = first.get("message")
-            if isinstance(message, dict) and isinstance(message.get("content"), str):
-                content = message["content"]
-            elif isinstance(first.get("text"), str):
-                content = first["text"]
-    translation = content.strip()
-    if not translation:
-        raise HTTPException(status_code=400, detail="翻译端点未返回译文。")
-    return TranslateOut(ok=True, translation=translation)
+
+    pieces: list[str] = []
+    if isinstance(parsed, dict):
+        for ch in parsed.get("choices") or []:
+            t = _text_from_stream_chunk_choice(ch)
+            if t:
+                pieces.append(t)
+        if not pieces:
+            output = parsed.get("output")
+            if isinstance(output, list):
+                for item in output:
+                    t = _openai_content_to_str(item)
+                    if t:
+                        pieces.append(t)
+            elif isinstance(output, (dict, str)):
+                t = _openai_content_to_str(output)
+                if t:
+                    pieces.append(t)
+        if not pieces:
+            for key in ("translation", "content", "text", "output_text", "response"):
+                val = parsed.get(key)
+                if isinstance(val, str) and val:
+                    pieces.append(val)
+                    break
+                if isinstance(val, (dict, list)):
+                    t = _openai_content_to_str(val)
+                    if t:
+                        pieces.append(t)
+                        break
+
+    translation = "".join(pieces).strip()
+    if translation:
+        return TranslateOut(ok=True, translation=translation)
+    stream_translation = _sync_translate_accumulate_via_stream(body)
+    if stream_translation:
+        return TranslateOut(ok=True, translation=stream_translation)
+    raise HTTPException(status_code=400, detail="翻译端点未返回译文。")
+
+
+@app.post(f"{_API_PREFIX}/translate", response_model=TranslateOut)
+async def translate_text(body: TranslateIn) -> TranslateOut:
+    return await asyncio.to_thread(_sync_translate_post_request, body)
 
 
 @app.websocket(f"{_API_PREFIX}/asr/ws")

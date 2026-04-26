@@ -129,7 +129,7 @@ export function SessionTextPanel({
         </div>
       </div>
       {errorText ? (
-        <p className="mb-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-200">
+        <p className="mb-2 whitespace-pre-line rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-200">
           {errorText}
         </p>
       ) : null}
@@ -144,7 +144,7 @@ export function SessionTextPanel({
         <div
           className={
             hasContent
-              ? "flex min-h-full min-w-0 flex-col items-start justify-end pr-0.5 pl-0.5"
+              ? "flex min-h-full min-w-0 flex-col items-start justify-start pr-0.5 pl-0.5"
               : "flex min-h-full min-w-0 flex-col items-center justify-center px-1"
           }
         >
