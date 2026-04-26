@@ -702,7 +702,7 @@ export function LiveSessionPage({
     const src = getLangLabel(sourceLang);
     const tgt = getLangLabel(targetLang);
     const orig = transcript.trim() || "（无原文）";
-    const trans = translation.trim() || EXPORT_NO_TRANSLATION;
+    const trans = visibleTranslation.trim() || EXPORT_NO_TRANSLATION;
     const body = `# 实时翻译会话\n\n## 原文（${src}）\n\n${orig}\n\n## 译文（${tgt}）\n\n${trans}\n`;
     const blob = new Blob([body], { type: "text/markdown;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -711,7 +711,7 @@ export function LiveSessionPage({
     a.download = "session-export.md";
     a.click();
     URL.revokeObjectURL(url);
-  }, [sourceLang, targetLang, transcript, translation]);
+  }, [sourceLang, targetLang, transcript, visibleTranslation]);
 
   const clearSession = useCallback(() => {
     streamAbortRef.current?.abort();
@@ -730,8 +730,10 @@ export function LiveSessionPage({
     latestTranscriptRef.current = "";
     lastAppliedSourceRef.current = "";
     translationCommittedRef.current = "";
+    translationDraftRef.current = "";
     uncommittedSinceRef.current = null;
     setTranslation("");
+    setTranslationDraft("");
     setTranslationError(null);
     setTranslationPending(false);
   }, [clearTranscript]);
@@ -833,7 +835,7 @@ export function LiveSessionPage({
           <SessionTextPanel
             title={`译文（${targetName}）`}
             role="translation"
-            copyValue={translation.trim() || translationBody}
+            copyValue={visibleTranslation.trim() || translationBody}
             body={translationBody}
             hasContent={hasTranslation}
             showPlaceholderBreathe={showTranslationBreathe}
