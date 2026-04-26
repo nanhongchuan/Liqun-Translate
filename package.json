@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "api": "cd backend && python3 -m uvicorn app.main:app --host 127.0.0.1 --port 18787",
+    "api:install": "cd backend && python3 -m pip install -r requirements.txt",
+    "test:api": "curl -fsS http://127.0.0.1:18787/api/health | grep -q llm_settings && curl -fsS -o /dev/null -w \"GET /api/settings/llm => %{http_code}\\n\" http://127.0.0.1:18787/api/settings/llm",
+    "api:verify": "curl -fsS http://127.0.0.1:18787/api/health | grep -q llm_test && echo 'OK: 18787 为本项目当前 API（含测试连接）。' || (echo 'FAIL: 18787 未启动或仍为旧版（健康检查无 llm_test）。请结束旧进程后在根目录执行 npm run api。' && exit 1)"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.2",

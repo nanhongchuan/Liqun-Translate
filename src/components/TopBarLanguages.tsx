@@ -2,7 +2,7 @@ import * as Select from "@radix-ui/react-select";
 import { ArrowLeftRight, ChevronDown } from "lucide-react";
 
 const selectTriggerClass =
-  "inline-flex h-9 min-w-[118px] items-center justify-between gap-2 rounded-xl border border-slate-200/90 bg-white px-3 text-sm text-slate-800 shadow-sm outline-none transition hover:border-slate-300 hover:bg-slate-50/80 focus-visible:ring-2 focus-visible:ring-violet-400/50 data-[state=open]:border-violet-300 data-[state=open]:ring-1 data-[state=open]:ring-violet-200";
+  "inline-flex h-9 min-w-0 items-center justify-between gap-2 rounded-xl border border-slate-200/90 bg-white px-3 text-sm text-slate-800 shadow-sm outline-none transition hover:border-slate-300 hover:bg-slate-50/80 focus-visible:ring-2 focus-visible:ring-violet-400/50 data-[state=open]:border-violet-300 data-[state=open]:ring-1 data-[state=open]:ring-violet-200";
 
 const selectContentClass =
   "z-50 overflow-hidden rounded-xl border border-slate-200 bg-white p-1 text-sm text-slate-800 shadow-card";
@@ -24,7 +24,12 @@ const LANGS = [
   { value: "zh", label: "中文" },
   { value: "ja", label: "日语" },
   { value: "ko", label: "韩语" },
-];
+] as const;
+
+export function getLangLabel(value: string): string {
+  const row = LANGS.find((l) => l.value === value);
+  return row?.label ?? value;
+}
 
 function LangSelect({
   value,
@@ -76,13 +81,13 @@ export function TopBarLanguages({
 
   return (
     <div
-      className={`flex flex-wrap items-center gap-2 ${isToolbar ? "justify-center" : ""} ${compact ? "" : isToolbar ? "" : "justify-start md:gap-4"}`}
+      className={`min-w-0 ${isToolbar ? "w-full max-w-[min(100%,28rem)]" : ""} ${compact ? "" : isToolbar ? "" : "md:gap-4"}`}
     >
       {!compact && !isToolbar && (
         <span className="text-xs font-medium uppercase tracking-wider text-slate-400">语言</span>
       )}
       <div
-        className={`flex flex-wrap items-center gap-1.5 rounded-2xl border border-slate-200/90 bg-white/90 p-1.5 shadow-sm ${isToolbar ? "ring-1 ring-slate-100" : "bg-slate-50/90 shadow-soft"}`}
+        className={`grid min-w-0 grid-cols-[minmax(5.75rem,1fr)_auto_minmax(5.75rem,1fr)] items-center gap-1.5 rounded-2xl border border-slate-200/90 bg-white/90 p-1.5 shadow-sm ${isToolbar ? "ring-1 ring-slate-100 max-[560px]:grid-cols-[minmax(0,1fr)_auto] max-[560px]:[&>*:last-child]:col-span-2" : "bg-slate-50/90 shadow-soft"}`}
       >
         <LangSelect value={sourceLang} onChange={onSourceChange} ariaLabel="源语言" />
         {onSwapLangs ? (

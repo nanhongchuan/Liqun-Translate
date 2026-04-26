@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
 import { LandingPage } from "./components/LandingPage";
@@ -8,20 +8,44 @@ import { PlaceholderPage } from "./components/PlaceholderPage";
 
 export type MainView = "landing" | "live" | "settings" | "history" | "favorites";
 
-const SIDEBAR_W = 256;
+const DEFAULT_SIDEBAR_W = 256;
+const MIN_SIDEBAR_W = 184;
+const MAX_SIDEBAR_W = 340;
+const HIDE_SIDEBAR_W = 88;
 
 export default function App() {
   const [mainView, setMainView] = useState<MainView>("landing");
   const [sourceLang, setSourceLang] = useState("en");
   const [targetLang, setTargetLang] = useState("zh");
   const [sidebarExpanded, setSidebarExpanded] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_W);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
+  const lastSidebarWidthRef = useRef(DEFAULT_SIDEBAR_W);
 
   const handleSwapLangs = useCallback(() => {
     const s = sourceLang;
     setSourceLang(targetLang);
     setTargetLang(s);
   }, [sourceLang, targetLang]);
+
+  const handleSourceChange = useCallback((nextSource: string) => {
+    setSourceLang((currentSource) => {
+      if (nextSource !== "auto" && nextSource === targetLang) {
+        setTargetLang(currentSource);
+      }
+      return nextSource;
+    });
+  }, [targetLang]);
+
+  const handleTargetChange = useCallback((nextTarget: string) => {
+    setTargetLang((currentTarget) => {
+      if (nextTarget !== "auto" && nextTarget === sourceLang) {
+        setSourceLang(currentTarget);
+      }
+      return nextTarget;
+    });
+  }, [sourceLang]);
 
   const goHome = useCallback(() => {
     setMainView("landing");
@@ -48,32 +72,98 @@ export default function App() {
   }, []);
 
   const toggleSidebar = useCallback(() => {
-    setSidebarExpanded((v) => !v);
+    setSidebarExpanded((v) => {
+      if (!v) {
+        setSidebarWidth(lastSidebarWidthRef.current);
+      }
+      return !v;
+    });
   }, []);
+
+  const startSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setIsResizingSidebar(true);
+  }, []);
+
+  useEffect(() => {
+    if (!isResizingSidebar) return;
+
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onPointerMove = (event: PointerEvent) => {
+      const nextWidth = event.clientX;
+      if (nextWidth <= HIDE_SIDEBAR_W) {
+        setSidebarExpanded(false);
+        return;
+      }
+      const clamped = Math.min(MAX_SIDEBAR_W, Math.max(MIN_SIDEBAR_W, nextWidth));
+      lastSidebarWidthRef.current = clamped;
+      setSidebarWidth(clamped);
+      setSidebarExpanded(true);
+    };
+
+    const onPointerUp = (event: PointerEvent) => {
+      if (event.clientX <= HIDE_SIDEBAR_W) {
+        setSidebarExpanded(false);
+      }
+      setIsResizingSidebar(false);
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp, { once: true });
+    window.addEventListener("pointercancel", onPointerUp, { once: true });
+
+    return () => {
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+  }, [isResizingSidebar]);
 
   const selectHome = useCallback(() => {
     if (mainView === "live") {
-      const ok = window.confirm("结束当前同传并返回首页？");
+      const ok = window.confirm("结束当前会话并返回开始页？");
       if (!ok) return;
     }
     goHome();
   }, [mainView, goHome]);
 
+  const selectLive = useCallback(() => {
+    setMainView("live");
+  }, []);
+
   return (
     <div className="relative flex h-full min-h-0 bg-slate-100 text-slate-800">
       <div
-        className={`relative flex h-full min-h-0 shrink-0 overflow-hidden transition-[width] duration-200 ease-out ${
-          sidebarExpanded ? "w-[256px]" : "pointer-events-none w-0"
+        className={`relative flex h-full min-h-0 shrink-0 overflow-hidden ${
+          isResizingSidebar ? "" : "transition-[width] duration-200 ease-out"
+        } ${
+          sidebarExpanded ? "" : "pointer-events-none"
         }`}
+        style={{ width: sidebarExpanded ? sidebarWidth : 0 }}
         aria-hidden={!sidebarExpanded}
         {...(!sidebarExpanded ? { inert: true } : {})}
       >
         <Sidebar
           mainView={mainView}
           onSelectHome={selectHome}
+          onSelectLive={selectLive}
           onSelectHistory={goHistory}
           onSelectFavorites={goFavorites}
           onSelectSettings={goSettings}
+        />
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整侧栏宽度"
+          title="拖动调整侧栏宽度，拉到最左隐藏"
+          onPointerDown={startSidebarResize}
+          className="absolute inset-y-0 right-0 z-30 w-2 cursor-col-resize touch-none bg-transparent after:absolute after:inset-y-0 after:right-0 after:w-px after:bg-transparent hover:after:bg-violet-300"
         />
       </div>
 
@@ -88,7 +178,7 @@ export default function App() {
             ? "top-[26px] -translate-x-1/2"
             : "left-3 top-[26px] translate-x-0"
         }`}
-        style={sidebarExpanded ? { left: SIDEBAR_W } : undefined}
+        style={sidebarExpanded ? { left: sidebarWidth } : undefined}
       >
         {sidebarExpanded ? (
           <ChevronLeft className="h-4 w-4" aria-hidden />
@@ -103,23 +193,24 @@ export default function App() {
         {mainView === "settings" ? (
           <SettingsPage onBack={goHome} />
         ) : mainView === "history" ? (
-          <PlaceholderPage title="历史记录" onBack={goHome} />
+          <PlaceholderPage title="记录" onBack={goHome} />
         ) : mainView === "favorites" ? (
-          <PlaceholderPage title="收藏短语" onBack={goHome} />
+          <PlaceholderPage title="收藏" onBack={goHome} />
         ) : mainView === "live" ? (
           <LiveSessionPage
             sourceLang={sourceLang}
             targetLang={targetLang}
-            onSourceChange={setSourceLang}
-            onTargetChange={setTargetLang}
+            onSourceChange={handleSourceChange}
+            onTargetChange={handleTargetChange}
+            onSwapLangs={handleSwapLangs}
             onStop={stopSession}
           />
         ) : (
           <LandingPage
             sourceLang={sourceLang}
             targetLang={targetLang}
-            onSourceChange={setSourceLang}
-            onTargetChange={setTargetLang}
+            onSourceChange={handleSourceChange}
+            onTargetChange={handleTargetChange}
             onSwapLangs={handleSwapLangs}
             onStart={startSession}
             darkMode={darkMode}

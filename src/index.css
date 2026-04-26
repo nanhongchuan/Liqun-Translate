@@ -9,8 +9,62 @@
   }
 }
 
+/** 同传：正在收录/连接时占位文案的轻量呼吸动效 */
+@keyframes asr-listening-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
 html,
 body,
 #root {
   height: 100%;
+}
+
+/**
+ * 原文流式区域：多行可向上滚动，默认隐藏滚动条，鼠标移入时显示以便回翻。
+ * 紧凑/展开两种高度共用此样式。
+ */
+@layer utilities {
+  .transcript-stream {
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .transcript-stream {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+  }
+  .transcript-stream:hover {
+    scrollbar-color: rgb(148 163 184) transparent;
+  }
+  .transcript-stream::-webkit-scrollbar {
+    width: 6px;
+  }
+  .transcript-stream::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .transcript-stream::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 4px;
+  }
+  .transcript-stream:hover::-webkit-scrollbar-thumb {
+    background: rgb(148 163 184);
+  }
+  .transcript-stream:hover::-webkit-scrollbar-thumb:hover {
+    background: rgb(100 116 139);
+  }
+  .asr-listening-breathe {
+    animation: asr-listening-breathe 1.6s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .asr-listening-breathe {
+      animation: none;
+      opacity: 1;
+    }
+  }
 }
