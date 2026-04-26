@@ -174,7 +174,20 @@ async function consumeTranslateNdjsonStream(
   const dec = new TextDecoder();
   let buffer = "";
   let accum = "";
+  let lastFlushAt = Date.now();
   let sawOk = false;
+  const flushDelta = (force = false) => {
+    if (!accum) return;
+    const now = Date.now();
+    if (
+      force
+      || now - lastFlushAt >= STREAM_DRAFT_FLUSH_MS
+      || /[\s,.;:!?，。！？；：、]$/.test(accum)
+    ) {
+      lastFlushAt = now;
+      onDelta(accum);
+    }
+  };
   while (true) {
     const { done, value } = await reader.read();
     if (isStale()) {
@@ -208,10 +221,11 @@ async function consumeTranslateNdjsonStream(
       }
       if (typeof o.c === "string") {
         accum += o.c;
-        onDelta(accum);
+        flushDelta(false);
       }
       if (o.ok === true) {
         sawOk = true;
+        flushDelta(true);
         return;
       }
     }
@@ -224,6 +238,7 @@ async function consumeTranslateNdjsonStream(
       }
       if (o.ok === true) {
         sawOk = true;
+        flushDelta(true);
       }
     } catch (e) {
       if (e instanceof Error && e.message !== "翻译流解析失败。") {
@@ -356,6 +371,27 @@ export function LiveSessionPage({
       if (snapshot === lastAppliedSourceRef.current) {
         uncommittedSinceRef.current = null;
         setTranslationPending(false);
+        return;
+      }
+      if (uncommittedSinceRef.current == null) {
+        uncommittedSinceRef.current = Date.now();
+      }
+      if (
+        !shouldTranslateSourceDelta(
+          snapshot,
+          lastAppliedSourceRef.current,
+          uncommittedSinceRef.current,
+        )
+      ) {
+        setTranslationPending(true);
+        const elapsed = Date.now() - uncommittedSinceRef.current;
+        const delay = Math.max(
+          80,
+          Math.min(TRANSLATE_STABLE_MS, TRANSLATE_MAX_LAG_MS - elapsed),
+        );
+        translateStableTimerRef.current = window.setTimeout(() => {
+          void runTranslate();
+        }, delay);
         return;
       }
 
@@ -578,11 +614,15 @@ export function LiveSessionPage({
     }
     const since = uncommittedSinceRef.current;
     const lagRemaining = Math.max(0, TRANSLATE_MAX_LAG_MS - (Date.now() - since));
+    setTranslationPending(true);
 
     const fire = () => {
       void runTranslate();
     };
-    translateStableTimerRef.current = window.setTimeout(fire, TRANSLATE_STABLE_MS);
+    const stableDelay = shouldTranslateSourceDelta(text, lastAppliedSourceRef.current, since)
+      ? TRANSLATE_STABLE_MS
+      : Math.min(TRANSLATE_STABLE_MS, lagRemaining);
+    translateStableTimerRef.current = window.setTimeout(fire, stableDelay);
     translateMaxLagTimerRef.current = window.setTimeout(fire, lagRemaining);
   };
 
