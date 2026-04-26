@@ -432,6 +432,10 @@ export function LiveSessionPage({
       });
       const composeResult = (next: string) =>
         incremental ? composeIncrementalTranslation(committedAtRequest, next) : next.trim();
+      if (!incremental && committedAtRequest) {
+        translationCommittedRef.current = "";
+        setTranslation("");
+      }
       const applyNonStreamResult = async (res: Response) => {
         if (!res.ok) {
           throw new Error(await readApiError(res));

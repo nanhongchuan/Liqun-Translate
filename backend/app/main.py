@@ -459,7 +459,8 @@ def _openai_translate_request_json(
         max_tokens = min(4096, max(256, int(len(text) * 1.6) + 128))
     context_block = ""
     translate_instruction = (
-        "Translate the full block below. Even short or incomplete phrases must be fully in the target language."
+        "Translate the full block below. It may be the latest buffered fragment of live speech; "
+        "keep the wording natural, do not over-literalize partial phrases, and fully use the target language."
     )
     if previous_source or previous_translation:
         context_bits: list[str] = []
@@ -470,7 +471,8 @@ def _openai_translate_request_json(
         context_block = "\n\n".join(context_bits)
         translate_instruction = (
             "Use the previous context only for continuity. Translate ONLY the current source block below; "
-            "do not repeat or revise the previous translation."
+            "do not repeat or revise the previous translation. If the current block is a fragment, "
+            "make it read naturally as a continuation."
         )
     return {
         "model": model,
