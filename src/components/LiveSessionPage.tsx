@@ -837,6 +837,8 @@ export function LiveSessionPage({
             role="translation"
             copyValue={visibleTranslation.trim() || translationBody}
             body={translationBody}
+            stableText={translation}
+            draftText={translationDraft}
             hasContent={hasTranslation}
             showPlaceholderBreathe={showTranslationBreathe}
             isLive={isLive}

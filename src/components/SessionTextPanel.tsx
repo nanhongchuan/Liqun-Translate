@@ -8,6 +8,8 @@ type Props = {
   role: "source" | "translation";
   copyValue: string;
   body: string;
+  stableText?: string;
+  draftText?: string;
   hasContent: boolean;
   /** 占位行：连接/进行中的轻量动效 */
   showPlaceholderBreathe: boolean;
@@ -35,6 +37,8 @@ export function SessionTextPanel({
   role,
   copyValue,
   body,
+  stableText,
+  draftText,
   hasContent,
   showPlaceholderBreathe,
   isLive,
@@ -95,6 +99,7 @@ export function SessionTextPanel({
   }, [expanded, overflows]);
 
   const copyLabel = role === "source" ? "原文" : "译文";
+  const hasDraftView = role === "translation" && Boolean(draftText?.trim());
   const ariaStream =
     role === "source"
       ? (expanded
@@ -161,7 +166,15 @@ export function SessionTextPanel({
                 }`
             }
           >
-            {body}
+            {hasDraftView ? (
+              <>
+                {stableText?.trim() ? <span>{stableText.trim()}</span> : null}
+                {stableText?.trim() && draftText?.trim() ? <span> </span> : null}
+                <span className="text-slate-500">{draftText?.trim()}</span>
+              </>
+            ) : (
+              body
+            )}
           </p>
         </div>
       </div>
